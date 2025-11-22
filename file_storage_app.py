@@ -47,6 +47,34 @@ class FileStorageDB:
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        # Users table for authentication
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                email TEXT,
+                is_admin INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+        """)
+        
+        # Migrate existing users table if needed (add is_admin column if it doesn't exist)
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            # Column already exists, skip
+            pass
+        
+        # Create default admin user if it doesn't exist
+        admin_username = "Admin-Sujay"
+        admin_password_hash = self.hash_password("Sjay-admin")
+        cursor.execute("""
+            INSERT OR IGNORE INTO users (username, password_hash, is_admin)
+            VALUES (?, ?, 1)
+        """, (admin_username, admin_password_hash))
+        
         # Files table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS files (
@@ -102,7 +130,7 @@ class FileStorageDB:
     
     def add_file(self, filename: str, file_path: str, file_size: int, 
                  folder_path: str = '', category: str = 'Uncategorized',
-                 description: str = '', tags: List[str] = None) -> int:
+                 description: str = '', tags: List[str] = None, created_by: str = 'user') -> int:
         """Add file metadata to database."""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -113,10 +141,10 @@ class FileStorageDB:
         
         cursor.execute("""
             INSERT INTO files (filename, original_filename, file_path, file_size,
-                             file_type, file_hash, folder_path, category, tags, description)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             file_type, file_hash, folder_path, category, tags, description, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (filename, filename, file_path, file_size, file_type, file_hash,
-              folder_path, category, tags_json, description))
+              folder_path, category, tags_json, description, created_by))
         
         file_id = cursor.lastrowid
         conn.commit()
@@ -362,6 +390,114 @@ class FileStorageDB:
             return sha256_hash.hexdigest()
         except Exception:
             return ""
+    
+    # Authentication methods
+    def hash_password(self, password: str) -> str:
+        """Hash a password using SHA256."""
+        return hashlib.sha256(password.encode()).hexdigest()
+    
+    def register_user(self, username: str, password: str, email: str = None) -> bool:
+        """Register a new user."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        password_hash = self.hash_password(password)
+        
+        try:
+            cursor.execute("""
+                INSERT INTO users (username, password_hash, email, is_admin)
+                VALUES (?, ?, ?, 0)
+            """, (username, password_hash, email))
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.IntegrityError:
+            conn.close()
+            return False
+    
+    def verify_user(self, username: str, password: str) -> Optional[Dict]:
+        """Verify user credentials and return user info if valid."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        password_hash = self.hash_password(password)
+        cursor.execute("""
+            SELECT * FROM users WHERE username = ? AND password_hash = ?
+        """, (username, password_hash))
+        
+        row = cursor.fetchone()
+        
+        if row:
+            # Update last login
+            cursor.execute("""
+                UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?
+            """, (row['id'],))
+            conn.commit()
+            conn.close()
+            return dict(row)
+        
+        conn.close()
+        return None
+    
+    def user_exists(self, username: str) -> bool:
+        """Check if username already exists."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
+    
+    def get_all_users(self) -> List[Dict]:
+        """Get all users (admin only)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, email, is_admin, created_at, last_login FROM users ORDER BY username")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    
+    def delete_user(self, user_id: int) -> bool:
+        """Delete a user (admin only)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Prevent deleting the default admin
+        cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        if user and user['username'] == 'Admin-Sujay':
+            conn.close()
+            return False
+        
+        try:
+            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception:
+            conn.close()
+            return False
+    
+    def update_user_admin_status(self, user_id: int, is_admin: bool) -> bool:
+        """Update user admin status (admin only)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Prevent removing admin status from default admin
+        cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        if user and user['username'] == 'Admin-Sujay':
+            conn.close()
+            return False
+        
+        try:
+            cursor.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if is_admin else 0, user_id))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception:
+            conn.close()
+            return False
 
 
 class FileStorageApp:
@@ -372,7 +508,7 @@ class FileStorageApp:
     
     def save_uploaded_file(self, uploaded_file, folder_path: str = '', 
                           category: str = 'Uncategorized', description: str = '',
-                          tags: List[str] = None) -> bool:
+                          tags: List[str] = None, created_by: str = 'user') -> bool:
         """Save uploaded file to storage."""
         try:
             # Create folder if needed
@@ -401,7 +537,8 @@ class FileStorageApp:
                 folder_path=folder_path,
                 category=category,
                 description=description,
-                tags=tags or []
+                tags=tags or [],
+                created_by=created_by
             )
             
             return True
@@ -442,7 +579,82 @@ class FileStorageApp:
             return "📦"
 
 
+def show_login_page(db: FileStorageDB):
+    """Display login/registration page."""
+    # Hide sidebar for login page
+    st.markdown("""
+        <style>
+            [data-testid="stSidebar"] {
+                display: none;
+            }
+            .main > div {
+                padding-top: 3rem;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # Center the login form
+    col1, col2, col3 = st.columns([1, 1.5, 1])
+    
+    with col2:
+        st.title("🔐 File Storage & Management")
+        st.markdown("### Welcome! Please login to access your files")
+        st.markdown("---")
+        
+        # Tabs for login and registration
+        tab1, tab2 = st.tabs(["🔑 Login", "📝 Register"])
+        
+        with tab1:
+            st.subheader("Login")
+            login_username = st.text_input("Username", key="login_username")
+            login_password = st.text_input("Password", type="password", key="login_password")
+            
+            if st.button("Login", type="primary", use_container_width=True):
+                if login_username and login_password:
+                    user = db.verify_user(login_username, login_password)
+                    if user:
+                        st.session_state.authenticated = True
+                        st.session_state.username = user['username']
+                        st.session_state.user_id = user['id']
+                        st.session_state.is_admin = bool(user.get('is_admin', 0))
+                        st.success(f"Welcome back, {user['username']}!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid username or password")
+                else:
+                    st.warning("Please enter both username and password")
+        
+        with tab2:
+            st.subheader("Create New Account")
+            reg_username = st.text_input("Username", key="reg_username")
+            reg_email = st.text_input("Email (optional)", key="reg_email")
+            reg_password = st.text_input("Password", type="password", key="reg_password")
+            reg_confirm_password = st.text_input("Confirm Password", type="password", key="reg_confirm_password")
+            
+            if st.button("Register", type="primary", use_container_width=True):
+                if not reg_username:
+                    st.error("❌ Username is required")
+                elif db.user_exists(reg_username):
+                    st.error("❌ Username already exists. Please choose a different one.")
+                elif not reg_password:
+                    st.error("❌ Password is required")
+                elif reg_password != reg_confirm_password:
+                    st.error("❌ Passwords do not match")
+                elif len(reg_password) < 4:
+                    st.error("❌ Password must be at least 4 characters long")
+                else:
+                    if db.register_user(reg_username, reg_password, reg_email if reg_email else None):
+                        st.success("✅ Registration successful! Please login.")
+                        st.balloons()
+                    else:
+                        st.error("❌ Registration failed. Please try again.")
+        
+        st.markdown("---")
+        st.caption("💡 Tip: Create an account to start storing and managing your files")
+
+
 def main():
+    # Set page config - must be called before any other streamlit calls
     st.set_page_config(
         page_title="File Storage & Management",
         page_icon="📁",
@@ -457,14 +669,44 @@ def main():
     app = st.session_state.app
     db = app.db
     
-    # Sidebar
+    # Check authentication
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    
+    # Show login page if not authenticated
+    if not st.session_state.authenticated:
+        show_login_page(db)
+        return
+    
+    # Sidebar with logout option
     st.sidebar.title("📁 File Storage")
+    
+    # Check if user is admin
+    is_admin = st.session_state.get('is_admin', False)
+    
+    # User info and logout
+    if 'username' in st.session_state:
+        user_display = f"👤 **{st.session_state.username}**"
+        if is_admin:
+            user_display += " 👑"
+        st.sidebar.markdown(user_display)
+        if st.sidebar.button("🚪 Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.username = None
+            st.session_state.user_id = None
+            st.session_state.is_admin = False
+            st.rerun()
+    
     st.sidebar.markdown("---")
     
-    # Navigation
+    # Navigation - include admin tab only for admins
+    nav_options = ["🏠 Home", "📤 Upload Files", "📂 Browse Files", "🗂️ Organize", "📊 Statistics"]
+    if is_admin:
+        nav_options.append("👑 User Management")
+    
     page = st.sidebar.radio(
         "Navigation",
-        ["🏠 Home", "📤 Upload Files", "📂 Browse Files", "🗂️ Organize", "📊 Statistics"]
+        nav_options
     )
     
     # Home page
@@ -556,6 +798,7 @@ def main():
                 status_text = st.empty()
                 
                 success_count = 0
+                current_user = st.session_state.get('username', 'user')
                 for i, uploaded_file in enumerate(uploaded_files):
                     status_text.text(f"Uploading {uploaded_file.name}...")
                     if app.save_uploaded_file(
@@ -563,7 +806,8 @@ def main():
                         folder_path=selected_folder,
                         category=selected_category,
                         description=description,
-                        tags=tags
+                        tags=tags,
+                        created_by=current_user
                     ):
                         success_count += 1
                     progress_bar.progress((i + 1) / len(uploaded_files))
@@ -632,13 +876,16 @@ def main():
                                     key=f"download_{file_info['id']}"
                                 )
                             
-                            # Delete button
-                            if st.button("🗑️ Delete", key=f"delete_{file_info['id']}"):
-                                if db.delete_file(file_info['id']):
-                                    st.success("File deleted successfully!")
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to delete file")
+                            # Delete button - admin only
+                            if is_admin:
+                                if st.button("🗑️ Delete", key=f"delete_{file_info['id']}"):
+                                    if db.delete_file(file_info['id']):
+                                        st.success("File deleted successfully!")
+                                        st.rerun()
+                                    else:
+                                        st.error("Failed to delete file")
+                            else:
+                                st.info("🔒 Only admins can delete files")
                         else:
                             st.error("File not found")
         else:
@@ -781,6 +1028,84 @@ def main():
             st.subheader("📊 Files by Type")
             type_df = pd.DataFrame(list(stats['by_type'].items()), columns=['Type', 'Count'])
             st.bar_chart(type_df.set_index('Type'))
+    
+    # Admin User Management page (admin only)
+    elif page == "👑 User Management":
+        if not is_admin:
+            st.error("🔒 Access Denied: Admin privileges required to access User Management.")
+            st.info("Please login as an administrator to access this page.")
+            st.stop()
+        
+        # User Management page content
+        st.title("👑 User Management")
+        st.markdown("Manage user accounts and permissions")
+        st.markdown("---")
+        
+        # Get all users
+        all_users = db.get_all_users()
+        
+        if all_users:
+            st.subheader("📋 All Users")
+            
+            # Display users in a table format
+            for user in all_users:
+                with st.expander(f"👤 {user['username']} {'👑' if user.get('is_admin', 0) else ''}"):
+                    col1, col2, col3 = st.columns([3, 2, 2])
+                    
+                    with col1:
+                        st.write(f"**Username:** {user['username']}")
+                        if user.get('email'):
+                            st.write(f"**Email:** {user['email']}")
+                        st.write(f"**Created:** {user.get('created_at', 'N/A')}")
+                        st.write(f"**Last Login:** {user.get('last_login', 'Never')}")
+                    
+                    with col2:
+                        admin_status = bool(user.get('is_admin', 0))
+                        is_default_admin = user['username'] == 'Admin-Sujay'
+                        
+                        if is_default_admin:
+                            st.info("👑 Default Admin Account")
+                            st.caption("Cannot modify or delete")
+                        else:
+                            new_admin_status = st.checkbox(
+                                "Admin Status",
+                                value=admin_status,
+                                key=f"admin_checkbox_{user['id']}"
+                            )
+                            if new_admin_status != admin_status:
+                                if db.update_user_admin_status(user['id'], new_admin_status):
+                                    st.success("Admin status updated!")
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to update admin status")
+                    
+                    with col3:
+                        if not is_default_admin:
+                            if st.button(f"🗑️ Delete User", key=f"delete_user_{user['id']}"):
+                                if db.delete_user(user['id']):
+                                    st.success(f"User '{user['username']}' deleted!")
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to delete user")
+                        else:
+                            st.caption("Cannot delete default admin")
+                    
+                    st.markdown("---")
+            
+            # Summary
+            total_users = len(all_users)
+            admin_count = sum(1 for u in all_users if u.get('is_admin', 0))
+            regular_users = total_users - admin_count
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Users", total_users)
+            with col2:
+                st.metric("Admin Users", admin_count)
+            with col3:
+                st.metric("Regular Users", regular_users)
+        else:
+            st.info("No users found.")
 
 
 if __name__ == "__main__":
