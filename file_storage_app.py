@@ -17,6 +17,7 @@ from typing import Optional, List, Dict
 import base64
 from io import BytesIO
 import pandas as pd
+import zipfile
 
 
 # Configuration
@@ -448,6 +449,22 @@ class FileStorageDB:
         conn.close()
         return exists
     
+    def find_duplicate_file(self, original_filename: str, folder_path: str = '') -> Optional[Dict]:
+        """Find duplicate file by original filename and folder path."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM files 
+            WHERE original_filename = ? AND folder_path = ?
+            LIMIT 1
+        """, (original_filename, folder_path))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return dict(row)
+        return None
+    
     def get_all_users(self) -> List[Dict]:
         """Get all users (admin only)."""
         conn = self.get_connection()
@@ -508,21 +525,40 @@ class FileStorageApp:
     
     def save_uploaded_file(self, uploaded_file, folder_path: str = '', 
                           category: str = 'Uncategorized', description: str = '',
-                          tags: List[str] = None, created_by: str = 'user') -> bool:
-        """Save uploaded file to storage."""
+                          tags: List[str] = None, created_by: str = 'user', 
+                          replace_existing: bool = False):
+        """Save uploaded file to storage.
+        
+        Returns:
+            tuple: (success: bool, message: str)
+        """
         try:
+            # Check for duplicate
+            duplicate = self.db.find_duplicate_file(uploaded_file.name, folder_path)
+            if duplicate and not replace_existing:
+                return False, "duplicate"
+            
             # Create folder if needed
             target_folder = STORAGE_DIR / folder_path if folder_path else STORAGE_DIR
             target_folder.mkdir(parents=True, exist_ok=True)
             
-            # Generate unique filename if file exists
-            file_path = target_folder / uploaded_file.name
-            counter = 1
-            while file_path.exists():
-                stem = file_path.stem
-                suffix = file_path.suffix
-                file_path = target_folder / f"{stem}_{counter}{suffix}"
-                counter += 1
+            # If replacing, use existing file path; otherwise generate unique filename
+            if duplicate and replace_existing:
+                file_path = Path(duplicate['file_path'])
+                # Delete old file
+                if file_path.exists():
+                    file_path.unlink()
+                # Delete from database
+                self.db.delete_file(duplicate['id'])
+            else:
+                # Generate unique filename if file exists
+                file_path = target_folder / uploaded_file.name
+                counter = 1
+                while file_path.exists():
+                    stem = file_path.stem
+                    suffix = file_path.suffix
+                    file_path = target_folder / f"{stem}_{counter}{suffix}"
+                    counter += 1
             
             # Save file
             with open(file_path, "wb") as f:
@@ -541,10 +577,9 @@ class FileStorageApp:
                 created_by=created_by
             )
             
-            return True
+            return True, "success"
         except Exception as e:
-            st.error(f"Error saving file: {str(e)}")
-            return False
+            return False, f"Error: {str(e)}"
     
     def format_file_size(self, size_bytes: int) -> str:
         """Format file size in human-readable format."""
@@ -577,6 +612,35 @@ class FileStorageApp:
             return "📄"
         else:
             return "📦"
+    
+    def create_zip_from_files(self, file_ids: List[int], db: FileStorageDB) -> Optional[BytesIO]:
+        """Create a zip file from multiple file IDs."""
+        zip_buffer = BytesIO()
+        
+        try:
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                added_files = 0
+                for file_id in file_ids:
+                    file_info = db.get_file(file_id)
+                    if file_info:
+                        file_path = Path(file_info['file_path'])
+                        if file_path.exists():
+                            # Use original filename in zip
+                            zip_file.write(
+                                str(file_path),
+                                arcname=file_info['original_filename']
+                            )
+                            added_files += 1
+                            # Update file access
+                            db.update_file_access(file_id)
+            
+            if added_files > 0:
+                zip_buffer.seek(0)
+                return zip_buffer
+            return None
+        except Exception as e:
+            st.error(f"Error creating zip file: {str(e)}")
+            return None
 
 
 def show_login_page(db: FileStorageDB):
@@ -700,7 +764,7 @@ def main():
     st.sidebar.markdown("---")
     
     # Navigation - include admin tab only for admins
-    nav_options = ["🏠 Home", "📤 Upload Files", "📂 Browse Files", "🗂️ Organize", "📊 Statistics"]
+    nav_options = ["🏠 Home", "📤 Upload Files", "📂 Browse Files", "🗂️ Organize", "📁 Files Type"]
     if is_admin:
         nav_options.append("👑 User Management")
     
@@ -792,28 +856,87 @@ def main():
                 # Description
                 description = st.text_area("📝 Description", height=100)
             
+            # Check for duplicates before upload
+            duplicates = {}
+            current_user = st.session_state.get('username', 'user')
+            
+            for uploaded_file in uploaded_files:
+                duplicate = db.find_duplicate_file(uploaded_file.name, selected_folder)
+                if duplicate:
+                    duplicates[uploaded_file.name] = duplicate
+            
+            # Show duplicate warning and handle them
+            replace_duplicates = False
+            if duplicates:
+                st.warning(f"⚠️ **{len(duplicates)} duplicate file(s) found!**")
+                with st.expander("📋 View Duplicate Files", expanded=True):
+                    for filename, dup_info in duplicates.items():
+                        st.write(f"📄 **{filename}** (Uploaded: {dup_info['uploaded_at']})")
+                
+                replace_duplicates = st.checkbox(
+                    "✅ Replace duplicate files",
+                    help="If checked, duplicate files will be replaced. If unchecked, they will be skipped.",
+                    key="replace_duplicates"
+                )
+            
             # Upload button
             if st.button("⬆️ Upload Files", type="primary"):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
                 success_count = 0
-                current_user = st.session_state.get('username', 'user')
+                skipped_count = 0
+                replaced_count = 0
+                error_count = 0
+                
                 for i, uploaded_file in enumerate(uploaded_files):
                     status_text.text(f"Uploading {uploaded_file.name}...")
-                    if app.save_uploaded_file(
+                    
+                    # Check if duplicate
+                    duplicate = db.find_duplicate_file(uploaded_file.name, selected_folder)
+                    should_replace = replace_duplicates if duplicate else False
+                    
+                    # Upload file
+                    success, message = app.save_uploaded_file(
                         uploaded_file,
                         folder_path=selected_folder,
                         category=selected_category,
                         description=description,
                         tags=tags,
-                        created_by=current_user
-                    ):
+                        created_by=current_user,
+                        replace_existing=should_replace
+                    )
+                    
+                    if success:
                         success_count += 1
+                        if duplicate and should_replace:
+                            replaced_count += 1
+                            st.success(f"✅ **{uploaded_file.name}** uploaded successfully (replaced existing file)!")
+                        else:
+                            st.success(f"✅ **{uploaded_file.name}** uploaded successfully!")
+                    elif message == "duplicate":
+                        skipped_count += 1
+                        st.info(f"⏭️ **{uploaded_file.name}** skipped - file already exists. Check 'Replace duplicate files' to replace it.")
+                    else:
+                        error_count += 1
+                        st.error(f"❌ **{uploaded_file.name}** failed: {message}")
+                    
                     progress_bar.progress((i + 1) / len(uploaded_files))
                 
-                status_text.text(f"✅ Successfully uploaded {success_count}/{len(uploaded_files)} files!")
-                st.success(f"Upload complete! {success_count} file(s) uploaded successfully.")
+                # Final summary
+                status_text.empty()
+                progress_bar.empty()
+                
+                summary_msg = f"**Upload Complete!**\n\n"
+                summary_msg += f"✅ Successfully uploaded: **{success_count}** file(s)\n"
+                if replaced_count > 0:
+                    summary_msg += f"🔄 Replaced: **{replaced_count}** file(s)\n"
+                if skipped_count > 0:
+                    summary_msg += f"⏭️ Skipped: **{skipped_count}** duplicate file(s)\n"
+                if error_count > 0:
+                    summary_msg += f"❌ Errors: **{error_count}** file(s)\n"
+                
+                st.success(summary_msg)
                 st.rerun()
     
     # Browse page
@@ -839,16 +962,84 @@ def main():
         folder = folder_filter if folder_filter != "All" else None
         files = db.get_files(folder_path=folder, category=category, search_query=search_query)
         
+        # Initialize selected files in session state
+        if 'selected_files' not in st.session_state:
+            st.session_state.selected_files = set()
+        
         st.markdown(f"**Found {len(files)} file(s)**")
+        
+        # Selection controls
+        if files:
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                st.write("")
+            with col2:
+                if st.button("✅ Select All", use_container_width=True):
+                    for file_info in files:
+                        file_id = file_info['id']
+                        st.session_state.selected_files.add(file_id)
+                        st.session_state[f"select_{file_id}"] = True
+                    st.rerun()
+            with col3:
+                if st.button("❌ Deselect All", use_container_width=True):
+                    st.session_state.selected_files = set()
+                    for file_info in files:
+                        file_id = file_info['id']
+                        st.session_state[f"select_{file_id}"] = False
+                    st.rerun()
+        
+        # Download selected files as zip
+        if st.session_state.selected_files:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.info(f"📦 {len(st.session_state.selected_files)} file(s) selected for download")
+            with col2:
+                if st.button("📥 Download Selected as ZIP", type="primary", use_container_width=True):
+                    selected_file_ids = list(st.session_state.selected_files)
+                    zip_buffer = app.create_zip_from_files(selected_file_ids, db)
+                    if zip_buffer:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        zip_filename = f"files_{timestamp}.zip"
+                        st.download_button(
+                            label="📥 Download ZIP File",
+                            data=zip_buffer.getvalue(),
+                            file_name=zip_filename,
+                            mime="application/zip",
+                            key="download_zip"
+                        )
+                        st.session_state.selected_files = set()
+                        st.rerun()
+        
+        # Clear selection button
+        if st.session_state.selected_files:
+            if st.button("❌ Clear Selection", use_container_width=False):
+                st.session_state.selected_files = set()
+                st.rerun()
+        
         st.markdown("---")
         
-        # Display files
+        # Display files with checkboxes
         if files:
             for file_info in files:
-                with st.expander(f"{app.get_file_icon(file_info['file_type'])} {file_info['original_filename']}"):
-                    col1, col2 = st.columns([3, 1])
+                file_id = file_info['id']
+                checkbox_key = f"select_{file_id}"
+                
+                # Initialize checkbox state
+                if checkbox_key not in st.session_state:
+                    st.session_state[checkbox_key] = file_id in st.session_state.selected_files
+                
+                with st.expander(f"{app.get_file_icon(file_info['file_type'])} {file_info['original_filename']}", expanded=False):
+                    col1, col2, col3 = st.columns([0.5, 2.5, 1])
                     
                     with col1:
+                        # Checkbox for selecting file
+                        checkbox_value = st.checkbox("Select", value=st.session_state[checkbox_key], key=checkbox_key)
+                        if checkbox_value:
+                            st.session_state.selected_files.add(file_id)
+                        else:
+                            st.session_state.selected_files.discard(file_id)
+                    
+                    with col2:
                         st.write(f"**Size:** {app.format_file_size(file_info['file_size'])}")
                         st.write(f"**Type:** {file_info['file_type']}")
                         st.write(f"**Category:** {file_info['category']}")
@@ -862,10 +1053,10 @@ def main():
                         st.write(f"**Uploaded:** {file_info['uploaded_at']}")
                         st.write(f"**Accessed:** {file_info['access_count']} times")
                     
-                    with col2:
+                    with col3:
                         file_path = Path(file_info['file_path'])
                         if file_path.exists():
-                            # Download button
+                            # Download button (single file)
                             with open(file_path, "rb") as f:
                                 file_data = f.read()
                                 db.update_file_access(file_info['id'])
@@ -880,6 +1071,7 @@ def main():
                             if is_admin:
                                 if st.button("🗑️ Delete", key=f"delete_{file_info['id']}"):
                                     if db.delete_file(file_info['id']):
+                                        st.session_state.selected_files.discard(file_info['id'])
                                         st.success("File deleted successfully!")
                                         st.rerun()
                                     else:
@@ -999,35 +1191,99 @@ def main():
             else:
                 st.info("No files to manage")
     
-    # Statistics page
-    elif page == "📊 Statistics":
-        st.title("📊 Storage Statistics")
+    # Files Type page
+    elif page == "📁 Files Type":
+        st.title("📁 Files by Type")
+        st.markdown("View and manage files organized by file type")
         
         stats = db.get_stats()
         
-        # Overview
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Files", stats['total_files'])
-            st.metric("Total Storage", app.format_file_size(stats['total_size']))
+        # Get files grouped by type
+        all_files = db.get_files()
         
-        with col2:
-            st.metric("Categories", len(stats['by_category']))
-            st.metric("File Types", len(stats['by_type']))
+        # Group files by type
+        files_by_type = {}
+        for file_info in all_files:
+            file_type = file_info.get('file_type', 'Unknown')
+            # Categorize file type
+            if file_type.startswith('image/'):
+                type_group = 'Images'
+            elif file_type.startswith('video/'):
+                type_group = 'Videos'
+            elif file_type.startswith('audio/'):
+                type_group = 'Audio'
+            elif file_type == 'application/pdf':
+                type_group = 'PDFs'
+            elif 'excel' in file_type or 'spreadsheet' in file_type:
+                type_group = 'Spreadsheets'
+            elif 'word' in file_type or 'document' in file_type:
+                type_group = 'Documents'
+            elif 'powerpoint' in file_type or 'presentation' in file_type:
+                type_group = 'Presentations'
+            elif file_type.startswith('text/'):
+                type_group = 'Text Files'
+            elif file_type.startswith('application/'):
+                type_group = 'Applications'
+            else:
+                type_group = 'Other'
+            
+            if type_group not in files_by_type:
+                files_by_type[type_group] = []
+            files_by_type[type_group].append(file_info)
         
-        st.markdown("---")
+        # Display file counts by type
+        st.subheader("📊 File Count by Type")
         
-        # Files by category
-        if stats['by_category']:
-            st.subheader("📊 Files by Category")
-            category_df = pd.DataFrame(list(stats['by_category'].items()), columns=['Category', 'Count'])
-            st.bar_chart(category_df.set_index('Category'))
-        
-        # Files by type
-        if stats['by_type']:
-            st.subheader("📊 Files by Type")
-            type_df = pd.DataFrame(list(stats['by_type'].items()), columns=['Type', 'Count'])
-            st.bar_chart(type_df.set_index('Type'))
+        if files_by_type:
+            # Create summary cards
+            type_counts = {k: len(v) for k, v in files_by_type.items()}
+            sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
+            
+            # Display metrics in columns
+            num_cols = min(4, len(sorted_types))
+            cols = st.columns(num_cols)
+            
+            for idx, (file_type, count) in enumerate(sorted_types):
+                with cols[idx % num_cols]:
+                    st.metric(file_type, count)
+            
+            st.markdown("---")
+            
+            # Display files grouped by type
+            for file_type, files in sorted(files_by_type.items(), key=lambda x: len(x[1]), reverse=True):
+                # Get icon for this file type
+                icon = app.get_file_icon(files[0]['file_type']) if files else "📄"
+                with st.expander(f"{icon} {file_type} ({len(files)} files)", expanded=False):
+                    st.markdown(f"**Total: {len(files)} file(s)**")
+                    
+                    # Display files in this category
+                    for file_info in files:
+                        col1, col2, col3 = st.columns([3, 2, 1])
+                        
+                        with col1:
+                            st.write(f"📄 **{file_info['original_filename']}**")
+                            st.caption(f"Size: {app.format_file_size(file_info['file_size'])} | Category: {file_info['category']}")
+                        
+                        with col2:
+                            st.caption(f"Uploaded: {file_info['uploaded_at']}")
+                            st.caption(f"Accessed: {file_info['access_count']} times")
+                        
+                        with col3:
+                            file_path = Path(file_info['file_path'])
+                            if file_path.exists():
+                                with open(file_path, "rb") as f:
+                                    file_data = f.read()
+                                    db.update_file_access(file_info['id'])
+                                    st.download_button(
+                                        label="📥",
+                                        data=file_data,
+                                        file_name=file_info['original_filename'],
+                                        key=f"download_type_{file_info['id']}"
+                                    )
+                        
+                        st.markdown("---")
+        else:
+            st.info("No files found. Upload some files to see them organized by type.")
     
     # Admin User Management page (admin only)
     elif page == "👑 User Management":
