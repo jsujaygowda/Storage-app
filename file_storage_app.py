@@ -126,10 +126,24 @@ class FileStorageDB:
             VALUES ('Uncategorized', '#808080', 'Default category for files')
         """)
         
+        # File permissions table for sharing files between users
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_permissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                permission_type TEXT DEFAULT 'read',
+                granted_by TEXT NOT NULL,
+                granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                UNIQUE(file_id, username)
+            )
+        """)
+        
         conn.commit()
         conn.close()
     
-    def add_file(self, filename: str, file_path: str, file_size: int, 
+    def add_file(self, filename: str, file_path: str, file_size: int,
                  folder_path: str = '', category: str = 'Uncategorized',
                  description: str = '', tags: List[str] = None, created_by: str = 'user') -> int:
         """Add file metadata to database."""
@@ -152,11 +166,22 @@ class FileStorageDB:
         conn.close()
         return file_id
     
-    def get_file(self, file_id: int) -> Optional[Dict]:
-        """Get file metadata by ID."""
+    def get_file(self, file_id: int, username: str = None, is_admin: bool = False) -> Optional[Dict]:
+        """Get file metadata by ID. Checks ownership/permissions unless user is admin."""
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM files WHERE id = ?", (file_id,))
+        
+        if is_admin:
+            # Admin can access any file
+            cursor.execute("SELECT * FROM files WHERE id = ?", (file_id,))
+        else:
+            # Regular users can only access their own files or files shared with them
+            cursor.execute("""
+                SELECT f.* FROM files f
+                LEFT JOIN file_permissions fp ON f.id = fp.file_id
+                WHERE f.id = ? AND (f.created_by = ? OR fp.username = ?)
+            """, (file_id, username, username))
+        
         row = cursor.fetchone()
         conn.close()
         
@@ -164,29 +189,134 @@ class FileStorageDB:
             return dict(row)
         return None
     
+    def can_access_file(self, file_id: int, username: str, is_admin: bool = False) -> bool:
+        """Check if user can access a file."""
+        if is_admin:
+            return True
+        
+        file_info = self.get_file(file_id, username, is_admin)
+        return file_info is not None
+    
+    def is_file_owner(self, file_id: int, username: str) -> bool:
+        """Check if user is the owner of a file."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT created_by FROM files WHERE id = ?", (file_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return row['created_by'] == username
+        return False
+    
+    def share_file(self, file_id: int, target_username: str, granted_by: str, is_admin: bool = False) -> bool:
+        """Share a file with another user."""
+        # Check if file exists
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT created_by FROM files WHERE id = ?", (file_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            conn.close()
+            return False
+        
+        file_owner = row['created_by']
+        
+        # Only owner or admin can share files
+        if not is_admin and file_owner != granted_by:
+            conn.close()
+            return False
+        
+        # Check if target user exists
+        if not self.user_exists(target_username):
+            conn.close()
+            return False
+        
+        # Don't share with owner
+        if target_username == file_owner:
+            conn.close()
+            return False
+        
+        try:
+            cursor.execute("""
+                INSERT INTO file_permissions (file_id, username, granted_by)
+                VALUES (?, ?, ?)
+            """, (file_id, target_username, granted_by))
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.IntegrityError:
+            # Permission already exists
+            conn.close()
+            return False
+    
+    def revoke_file_permission(self, file_id: int, username: str, revoked_by: str) -> bool:
+        """Revoke file permission from a user."""
+        # Check if revoker is owner
+        if not self.is_file_owner(file_id, revoked_by):
+            return False
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM file_permissions 
+            WHERE file_id = ? AND username = ?
+        """, (file_id, username))
+        conn.commit()
+        conn.close()
+        return True
+    
+    def get_shared_files(self, username: str) -> List[Dict]:
+        """Get files shared with a user."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT f.*, fp.granted_by, fp.granted_at 
+            FROM files f
+            INNER JOIN file_permissions fp ON f.id = fp.file_id
+            WHERE fp.username = ?
+            ORDER BY fp.granted_at DESC
+        """, (username,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    
     def get_files(self, folder_path: str = None, category: str = None,
-                  search_query: str = None, limit: int = None) -> List[Dict]:
-        """Get files with optional filters."""
+                  search_query: str = None, limit: int = None,
+                  username: str = None, is_admin: bool = False) -> List[Dict]:
+        """Get files with optional filters. Filters by ownership unless user is admin."""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        query = "SELECT * FROM files WHERE 1=1"
-        params = []
+        # Base query
+        if is_admin:
+            # Admin can see all files
+            query = "SELECT DISTINCT f.* FROM files f WHERE 1=1"
+            params = []
+        else:
+            # Regular users see only their files or files shared with them
+            query = """
+                SELECT DISTINCT f.* FROM files f
+                LEFT JOIN file_permissions fp ON f.id = fp.file_id
+                WHERE (f.created_by = ? OR fp.username = ?)
+            """
+            params = [username, username]
         
         if folder_path is not None:
-            query += " AND folder_path = ?"
+            query += " AND f.folder_path = ?"
             params.append(folder_path)
         
         if category:
-            query += " AND category = ?"
+            query += " AND f.category = ?"
             params.append(category)
         
         if search_query:
-            query += " AND (filename LIKE ? OR description LIKE ? OR tags LIKE ?)"
+            query += " AND (f.filename LIKE ? OR f.description LIKE ? OR f.tags LIKE ?)"
             search_pattern = f"%{search_query}%"
             params.extend([search_pattern, search_pattern, search_pattern])
         
-        query += " ORDER BY uploaded_at DESC"
+        query += " ORDER BY f.uploaded_at DESC"
         
         if limit:
             query += " LIMIT ?"
@@ -330,46 +460,76 @@ class FileStorageDB:
         
         return True
     
-    def get_stats(self) -> Dict:
-        """Get storage statistics."""
+    def get_stats(self, username: str = None, is_admin: bool = False) -> Dict:
+        """Get storage statistics. Filters by user unless admin."""
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        # Base query for accessible files
+        if is_admin:
+            # Admin sees all files
+            file_filter = "1=1"
+            params = []
+        else:
+            # Regular users see only their files or files shared with them
+            file_filter = """
+                f.id IN (
+                    SELECT DISTINCT f2.id FROM files f2
+                    LEFT JOIN file_permissions fp ON f2.id = fp.file_id
+                    WHERE (f2.created_by = ? OR fp.username = ?)
+                )
+            """
+            params = [username, username]
+        
         # Total files
-        cursor.execute("SELECT COUNT(*) as count FROM files")
+        total_files_query = f"""
+            SELECT COUNT(*) as count 
+            FROM files f
+            WHERE {file_filter}
+        """
+        cursor.execute(total_files_query, params)
         total_files = cursor.fetchone()['count']
         
         # Total size
-        cursor.execute("SELECT SUM(file_size) as total_size FROM files")
+        total_size_query = f"""
+            SELECT SUM(f.file_size) as total_size 
+            FROM files f
+            WHERE {file_filter}
+        """
+        cursor.execute(total_size_query, params)
         result = cursor.fetchone()
         total_size = result['total_size'] or 0
         
         # Files by category
-        cursor.execute("""
-            SELECT category, COUNT(*) as count 
-            FROM files 
-            GROUP BY category
-        """)
+        category_query = f"""
+            SELECT f.category, COUNT(*) as count 
+            FROM files f
+            WHERE {file_filter}
+            GROUP BY f.category
+        """
+        cursor.execute(category_query, params)
         by_category = {row['category']: row['count'] for row in cursor.fetchall()}
         
         # Files by type
-        cursor.execute("""
+        type_query = f"""
             SELECT 
                 CASE 
-                    WHEN file_type LIKE 'image/%' THEN 'Images'
-                    WHEN file_type LIKE 'video/%' THEN 'Videos'
-                    WHEN file_type LIKE 'audio/%' THEN 'Audio'
-                    WHEN file_type LIKE 'application/pdf' THEN 'PDFs'
-                    WHEN file_type LIKE 'application/vnd.ms-excel%' OR file_type LIKE 'application/vnd.openxmlformats-officedocument.spreadsheetml%' THEN 'Spreadsheets'
-                    WHEN file_type LIKE 'application/vnd.ms-powerpoint%' OR file_type LIKE 'application/vnd.openxmlformats-officedocument.presentationml%' THEN 'Presentations'
-                    WHEN file_type LIKE 'application/msword%' OR file_type LIKE 'application/vnd.openxmlformats-officedocument.wordprocessingml%' THEN 'Documents'
-                    WHEN file_type LIKE 'text/%' THEN 'Text Files'
+                    WHEN f.file_type LIKE 'image/%' THEN 'Images'
+                    WHEN f.file_type LIKE 'video/%' THEN 'Videos'
+                    WHEN f.file_type LIKE 'audio/%' THEN 'Audio'
+                    WHEN f.file_type = 'application/pdf' THEN 'PDFs'
+                    WHEN f.file_type LIKE 'application/vnd.ms-excel%' OR f.file_type LIKE 'application/vnd.openxmlformats-officedocument.spreadsheetml%' THEN 'Spreadsheets'
+                    WHEN f.file_type LIKE 'application/vnd.ms-powerpoint%' OR f.file_type LIKE 'application/vnd.openxmlformats-officedocument.presentationml%' THEN 'Presentations'
+                    WHEN f.file_type LIKE 'application/msword%' OR f.file_type LIKE 'application/vnd.openxmlformats-officedocument.wordprocessingml%' THEN 'Documents'
+                    WHEN f.file_type LIKE 'text/%' THEN 'Text Files'
                     ELSE 'Other'
                 END as file_group,
                 COUNT(*) as count
-            FROM files
+            FROM files f
+            WHERE {file_filter}
             GROUP BY file_group
-        """)
+        """
+        cursor.execute(type_query, params)
         by_type = {row['file_group']: row['count'] for row in cursor.fetchall()}
         
         conn.close()
@@ -523,9 +683,9 @@ class FileStorageApp:
     def __init__(self):
         self.db = FileStorageDB()
     
-    def save_uploaded_file(self, uploaded_file, folder_path: str = '', 
+    def save_uploaded_file(self, uploaded_file, folder_path: str = '',
                           category: str = 'Uncategorized', description: str = '',
-                          tags: List[str] = None, created_by: str = 'user', 
+                          tags: List[str] = None, created_by: str = 'user',
                           replace_existing: bool = False):
         """Save uploaded file to storage.
         
@@ -778,8 +938,9 @@ def main():
         st.title("🏠 File Storage & Management System")
         st.markdown("Welcome to your personal file storage system!")
         
-        # Statistics cards
-        stats = db.get_stats()
+        # Statistics cards - filtered by user
+        current_username = st.session_state.get('username')
+        stats = db.get_stats(username=current_username, is_admin=is_admin)
         
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -795,7 +956,8 @@ def main():
         
         # Recent files
         st.subheader("📋 Recent Files")
-        recent_files = db.get_files(limit=10)
+        current_username = st.session_state.get('username')
+        recent_files = db.get_files(limit=10, username=current_username, is_admin=is_admin)
         
         if recent_files:
             for file_info in recent_files:
@@ -822,6 +984,38 @@ def main():
                                 )
         else:
             st.info("No files uploaded yet. Upload your first file!")
+        
+        # Shared files section
+        if not is_admin:
+            st.markdown("---")
+            st.subheader("📤 Files Shared with Me")
+            shared_files = db.get_shared_files(current_username)
+            
+            if shared_files:
+                for file_info in shared_files:
+                    col1, col2, col3, col4 = st.columns([1, 4, 2, 1])
+                    with col1:
+                        st.write(app.get_file_icon(file_info['file_type']))
+                    with col2:
+                        st.write(f"**{file_info['original_filename']}**")
+                        st.caption(f"Shared by: {file_info.get('granted_by', 'Unknown')}")
+                        if file_info['description']:
+                            st.caption(file_info['description'])
+                    with col3:
+                        st.caption(f"{app.format_file_size(file_info['file_size'])} • {file_info['category']}")
+                    with col4:
+                        file_path = Path(file_info['file_path'])
+                        if file_path.exists():
+                            db.update_file_access(file_info['id'])
+                            with open(file_path, "rb") as f:
+                                st.download_button(
+                                    label="📥",
+                                    data=f.read(),
+                                    file_name=file_info['original_filename'],
+                                    key=f"shared_dl_{file_info['id']}"
+                                )
+            else:
+                st.info("No files shared with you yet.")
     
     # Upload page
     elif page == "📤 Upload Files":
@@ -960,7 +1154,9 @@ def main():
         # Get files
         category = category_filter if category_filter != "All" else None
         folder = folder_filter if folder_filter != "All" else None
-        files = db.get_files(folder_path=folder, category=category, search_query=search_query)
+        current_username = st.session_state.get('username')
+        files = db.get_files(folder_path=folder, category=category, search_query=search_query,
+                            username=current_username, is_admin=is_admin)
         
         # Initialize selected files in session state
         if 'selected_files' not in st.session_state:
@@ -1044,6 +1240,7 @@ def main():
                         st.write(f"**Type:** {file_info['file_type']}")
                         st.write(f"**Category:** {file_info['category']}")
                         st.write(f"**Folder:** {file_info['folder_path'] or 'Root'}")
+                        st.write(f"**Owner:** {file_info['created_by']}")
                         if file_info['description']:
                             st.write(f"**Description:** {file_info['description']}")
                         if file_info['tags']:
@@ -1052,6 +1249,68 @@ def main():
                                 st.write(f"**Tags:** {', '.join(tags)}")
                         st.write(f"**Uploaded:** {file_info['uploaded_at']}")
                         st.write(f"**Accessed:** {file_info['access_count']} times")
+                        
+                        # File sharing section (only for file owners or admin)
+                        current_username = st.session_state.get('username')
+                        is_file_owner = file_info['created_by'] == current_username
+                        if is_file_owner or is_admin:
+                            st.markdown("---")
+                            st.subheader("🔗 Share File")
+                            
+                            # Get all users
+                            all_users = db.get_all_users()
+                            # Filter out current user and admin if not admin
+                            shareable_users = [u for u in all_users
+                                             if u['username'] != current_username
+                                             and (is_admin or u['username'] != 'Admin-Sujay')]
+                            
+                            if shareable_users:
+                                share_user = st.selectbox(
+                                    "Select user to share with:",
+                                    [""] + [u['username'] for u in shareable_users],
+                                    key=f"share_user_{file_id}"
+                                )
+                                
+                                col_share1, col_share2 = st.columns(2)
+                                with col_share1:
+                                    if st.button("Share", key=f"share_btn_{file_id}"):
+                                        if share_user:
+                                            if db.share_file(file_id, share_user, current_username, is_admin):
+                                                st.success(f"✅ File shared with {share_user}!")
+                                                st.rerun()
+                                            else:
+                                                st.error("❌ Failed to share file. It may already be shared.")
+                                        else:
+                                            st.warning("Please select a user")
+                                
+                                # Show current shares
+                                conn = db.get_connection()
+                                cursor = conn.cursor()
+                                cursor.execute("""
+                                    SELECT username FROM file_permissions WHERE file_id = ?
+                                """, (file_id,))
+                                shared_with = [row['username'] for row in cursor.fetchall()]
+                                conn.close()
+                                
+                                if shared_with:
+                                    st.write(f"**Shared with:** {', '.join(shared_with)}")
+                                    with col_share2:
+                                        revoke_user = st.selectbox(
+                                            "Revoke access from:",
+                                            [""] + shared_with,
+                                            key=f"revoke_user_{file_id}"
+                                        )
+                                        if st.button("Revoke", key=f"revoke_btn_{file_id}"):
+                                            if revoke_user:
+                                                if db.revoke_file_permission(file_id, revoke_user, current_username):
+                                                    st.success(f"✅ Access revoked from {revoke_user}")
+                                                    st.rerun()
+                                                else:
+                                                    st.error("❌ Failed to revoke access")
+                                            else:
+                                                st.warning("Please select a user")
+                            else:
+                                st.info("No other users available to share with")
                     
                     with col3:
                         file_path = Path(file_info['file_path'])
@@ -1067,8 +1326,11 @@ def main():
                                     key=f"download_{file_info['id']}"
                                 )
                             
-                            # Delete button - admin only
-                            if is_admin:
+                            # Delete button - admin or owner can delete
+                            current_username = st.session_state.get('username')
+                            can_delete = is_admin or file_info['created_by'] == current_username
+                            
+                            if can_delete:
                                 if st.button("🗑️ Delete", key=f"delete_{file_info['id']}"):
                                     if db.delete_file(file_info['id']):
                                         st.session_state.selected_files.discard(file_info['id'])
@@ -1077,7 +1339,7 @@ def main():
                                     else:
                                         st.error("Failed to delete file")
                             else:
-                                st.info("🔒 Only admins can delete files")
+                                st.info("🔒 Only file owner or admin can delete files")
                         else:
                             st.error("File not found")
         else:
@@ -1150,14 +1412,15 @@ def main():
             st.subheader("📝 Manage Files")
             
             # Get all files
-            all_files = db.get_files()
+            current_username = st.session_state.get('username')
+            all_files = db.get_files(username=current_username, is_admin=is_admin)
             
             if all_files:
                 file_options = {f"{f['original_filename']} (ID: {f['id']})": f['id'] for f in all_files}
                 selected_file_label = st.selectbox("Select File", list(file_options.keys()))
                 selected_file_id = file_options[selected_file_label]
                 
-                file_info = db.get_file(selected_file_id)
+                file_info = db.get_file(selected_file_id, username=current_username, is_admin=is_admin)
                 
                 if file_info:
                     col1, col2 = st.columns(2)
@@ -1196,10 +1459,12 @@ def main():
         st.title("📁 Files by Type")
         st.markdown("View and manage files organized by file type")
         
-        stats = db.get_stats()
+        # Get user-filtered statistics
+        current_username = st.session_state.get('username')
+        stats = db.get_stats(username=current_username, is_admin=is_admin)
         
         # Get files grouped by type
-        all_files = db.get_files()
+        all_files = db.get_files(username=current_username, is_admin=is_admin)
         
         # Group files by type
         files_by_type = {}
