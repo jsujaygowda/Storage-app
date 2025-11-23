@@ -341,11 +341,23 @@ class FileStorageDB:
         conn.commit()
         conn.close()
     
-    def delete_file(self, file_id: int) -> bool:
+    def delete_file(self, file_id: int, username: str = None, is_admin: bool = False) -> bool:
         """Delete file from database and filesystem."""
-        file_info = self.get_file(file_id)
-        if not file_info:
-            return False
+        # Get file info - for admin or if checking permissions
+        if username and not is_admin:
+            file_info = self.get_file(file_id, username, is_admin)
+            if not file_info:
+                return False
+        else:
+            # Admin or internal use - get file directly
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM files WHERE id = ?", (file_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return False
+            file_info = dict(row)
         
         # Delete from filesystem
         file_path = Path(file_info['file_path'])
@@ -356,10 +368,86 @@ class FileStorageDB:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        # Also delete permissions for this file
+        cursor.execute("DELETE FROM file_permissions WHERE file_id = ?", (file_id,))
         conn.commit()
         conn.close()
         
         return True
+    
+    def find_orphaned_db_entries(self, username: str = None, is_admin: bool = False) -> List[Dict]:
+        """Find files in database that don't exist on filesystem."""
+        if is_admin:
+            all_files = self.get_files(username=None, is_admin=True)
+        else:
+            all_files = self.get_files(username=username, is_admin=False)
+        
+        orphaned = []
+        for file_info in all_files:
+            file_path = Path(file_info['file_path'])
+            if not file_path.exists():
+                orphaned.append(file_info)
+        
+        return orphaned
+    
+    def find_orphaned_files(self) -> List[Path]:
+        """Find files on filesystem that don't exist in database."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_path FROM files")
+        db_paths = {Path(row['file_path']) for row in cursor.fetchall()}
+        conn.close()
+        
+        # Get all files in storage directory
+        storage_path = Path(STORAGE_DIR)
+        orphaned = []
+        
+        if storage_path.exists():
+            for file_path in storage_path.rglob('*'):
+                if file_path.is_file() and file_path not in db_paths:
+                    # Skip thumbnails directory
+                    if 'thumbnails' not in str(file_path):
+                        orphaned.append(file_path)
+        
+        return orphaned
+    
+    def cleanup_orphaned_db_entries(self, file_ids: List[int], username: str = None, is_admin: bool = False) -> int:
+        """Delete orphaned database entries."""
+        deleted_count = 0
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        for file_id in file_ids:
+            # Get file info directly (for cleanup, we check ownership separately)
+            cursor.execute("SELECT * FROM files WHERE id = ?", (file_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                file_info = dict(row)
+                # Check if user has access (owner or admin)
+                if is_admin or file_info['created_by'] == username:
+                    file_path = Path(file_info['file_path'])
+                    if not file_path.exists():
+                        # Delete from database
+                        cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+                        cursor.execute("DELETE FROM file_permissions WHERE file_id = ?", (file_id,))
+                        deleted_count += 1
+        
+        conn.commit()
+        conn.close()
+        return deleted_count
+    
+    def cleanup_orphaned_files(self, file_paths: List[Path]) -> int:
+        """Delete orphaned files from filesystem."""
+        deleted_count = 0
+        for file_path in file_paths:
+            try:
+                if file_path.exists() and file_path.is_file():
+                    file_path.unlink()
+                    deleted_count += 1
+            except Exception:
+                pass
+        return deleted_count
     
     def create_folder(self, name: str, parent_path: str = '') -> bool:
         """Create a new folder."""
@@ -708,8 +796,10 @@ class FileStorageApp:
                 # Delete old file
                 if file_path.exists():
                     file_path.unlink()
-                # Delete from database
-                self.db.delete_file(duplicate['id'])
+                # Delete from database (admin can delete any file during replace)
+                current_user = st.session_state.get('username', 'user')
+                is_admin_user = st.session_state.get('is_admin', False)
+                self.db.delete_file(duplicate['id'], current_user, is_admin_user)
             else:
                 # Generate unique filename if file exists
                 file_path = target_folder / uploaded_file.name
@@ -1332,7 +1422,7 @@ def main():
                             
                             if can_delete:
                                 if st.button("🗑️ Delete", key=f"delete_{file_info['id']}"):
-                                    if db.delete_file(file_info['id']):
+                                    if db.delete_file(file_info['id'], current_username, is_admin):
                                         st.session_state.selected_files.discard(file_info['id'])
                                         st.success("File deleted successfully!")
                                         st.rerun()
@@ -1349,7 +1439,7 @@ def main():
     elif page == "🗂️ Organize":
         st.title("🗂️ Organize Files")
         
-        tab1, tab2, tab3 = st.tabs(["📂 Folders", "🏷️ Categories", "📝 Manage Files"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📂 Folders", "🏷️ Categories", "📝 Manage Files", "🧹 Cleanup"])
         
         with tab1:
             st.subheader("📂 Manage Folders")
@@ -1453,6 +1543,146 @@ def main():
                             st.rerun()
             else:
                 st.info("No files to manage")
+        
+        with tab4:
+            st.subheader("🧹 Cleanup Orphaned Files")
+            st.markdown("Find and remove files that are missing from storage or database entries without files.")
+            st.markdown("---")
+            
+            current_username = st.session_state.get('username')
+            
+            # Scan for orphaned entries
+            if st.button("🔍 Scan for Orphaned Files", type="primary"):
+                with st.spinner("Scanning for orphaned files..."):
+                    # Find orphaned database entries
+                    orphaned_db = db.find_orphaned_db_entries(username=current_username, is_admin=is_admin)
+                    # Find orphaned files on disk
+                    orphaned_files = db.find_orphaned_files()
+                    
+                    st.session_state['orphaned_db_entries'] = orphaned_db
+                    st.session_state['orphaned_files'] = orphaned_files
+                    st.rerun()
+            
+            # Display orphaned database entries
+            if 'orphaned_db_entries' in st.session_state and st.session_state['orphaned_db_entries']:
+                st.markdown("### ⚠️ Orphaned Database Entries")
+                st.warning(f"Found {len(st.session_state['orphaned_db_entries'])} database entries for files that don't exist on disk.")
+                
+                # Show list of orphaned entries
+                selected_orphaned_ids = []
+                for file_info in st.session_state['orphaned_db_entries']:
+                    col1, col2, col3 = st.columns([1, 4, 1])
+                    with col1:
+                        selected = st.checkbox("", key=f"orphan_db_{file_info['id']}")
+                        if selected:
+                            selected_orphaned_ids.append(file_info['id'])
+                    with col2:
+                        st.write(f"**{file_info['original_filename']}**")
+                        st.caption(f"Path: {file_info['file_path']} | Owner: {file_info['created_by']} | Size: {app.format_file_size(file_info['file_size'])}")
+                    with col3:
+                        st.caption(f"ID: {file_info['id']}")
+                
+                st.markdown("---")
+                
+                # Delete selected orphaned entries
+                if selected_orphaned_ids:
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.info(f"**{len(selected_orphaned_ids)}** orphaned database entry/entries selected for deletion")
+                    with col2:
+                        if st.button("🗑️ Delete Selected", type="primary"):
+                            deleted = db.cleanup_orphaned_db_entries(selected_orphaned_ids, current_username, is_admin)
+                            if deleted > 0:
+                                st.success(f"✅ Deleted {deleted} orphaned database entry/entries!")
+                                # Remove from session state
+                                st.session_state['orphaned_db_entries'] = [
+                                    f for f in st.session_state['orphaned_db_entries']
+                                    if f['id'] not in selected_orphaned_ids
+                                ]
+                                st.rerun()
+                            else:
+                                st.error("❌ Failed to delete some entries")
+                
+                # Delete all button
+                if st.button("🗑️ Delete All Orphaned DB Entries", type="secondary"):
+                    all_ids = [f['id'] for f in st.session_state['orphaned_db_entries']]
+                    deleted = db.cleanup_orphaned_db_entries(all_ids, current_username, is_admin)
+                    if deleted > 0:
+                        st.success(f"✅ Deleted {deleted} orphaned database entry/entries!")
+                        st.session_state['orphaned_db_entries'] = []
+                        st.rerun()
+            
+            # Display orphaned files on disk
+            if 'orphaned_files' in st.session_state and st.session_state['orphaned_files']:
+                st.markdown("### 📁 Orphaned Files on Disk")
+                st.warning(f"Found {len(st.session_state['orphaned_files'])} files on disk that are not in the database.")
+                
+                # Show list of orphaned files
+                selected_orphaned_paths = []
+                for file_path in st.session_state['orphaned_files']:
+                    col1, col2, col3 = st.columns([1, 4, 1])
+                    with col1:
+                        selected = st.checkbox("", key=f"orphan_file_{hash(str(file_path))}")
+                        if selected:
+                            selected_orphaned_paths.append(file_path)
+                    with col2:
+                        st.write(f"**{file_path.name}**")
+                        try:
+                            file_size = file_path.stat().st_size
+                            st.caption(f"Path: {file_path} | Size: {app.format_file_size(file_size)}")
+                        except:
+                            st.caption(f"Path: {file_path}")
+                    with col3:
+                        st.caption("Not in DB")
+                
+                st.markdown("---")
+                
+                # Delete selected orphaned files
+                if selected_orphaned_paths:
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.info(f"**{len(selected_orphaned_paths)}** orphaned file(s) selected for deletion")
+                    with col2:
+                        if st.button("🗑️ Delete Selected Files", type="primary", key="delete_selected_orphaned"):
+                            deleted = db.cleanup_orphaned_files(selected_orphaned_paths)
+                            if deleted > 0:
+                                st.success(f"✅ Deleted {deleted} orphaned file(s)!")
+                                # Remove from session state
+                                st.session_state['orphaned_files'] = [
+                                    f for f in st.session_state['orphaned_files']
+                                    if f not in selected_orphaned_paths
+                                ]
+                                st.rerun()
+                            else:
+                                st.error("❌ Failed to delete some files")
+                
+                # Delete all button
+                if st.button("🗑️ Delete All Orphaned Files", type="secondary"):
+                    deleted = db.cleanup_orphaned_files(st.session_state['orphaned_files'])
+                    if deleted > 0:
+                        st.success(f"✅ Deleted {deleted} orphaned file(s)!")
+                        st.session_state['orphaned_files'] = []
+                        st.rerun()
+            
+            # Summary if no orphaned files found
+            if ('orphaned_db_entries' not in st.session_state or not st.session_state.get('orphaned_db_entries')) and \
+               ('orphaned_files' not in st.session_state or not st.session_state.get('orphaned_files')):
+                if 'orphaned_db_entries' in st.session_state or 'orphaned_files' in st.session_state:
+                    st.success("✅ No orphaned files found! Your storage is clean.")
+                else:
+                    st.info("👆 Click 'Scan for Orphaned Files' to check for missing files or database entries.")
+            
+            st.markdown("---")
+            st.markdown("### ℹ️ About Cleanup")
+            st.markdown("""
+            **Orphaned Database Entries**: Files that are recorded in the database but the actual file is missing from disk.
+            - These can occur if files were manually deleted from the file system
+            - Safe to delete - removes database entries only
+            
+            **Orphaned Files**: Files that exist on disk but are not recorded in the database.
+            - These can occur if files were added manually to the storage directory
+            - Safe to delete - removes files from disk only
+            """)
     
     # Files Type page
     elif page == "📁 Files Type":
